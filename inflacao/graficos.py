@@ -50,7 +50,7 @@ def barras(serie: pd.Series, titulo: str, nome: str, rotulos: bool = True, altur
     x = [rotulo_mes(d) for d in s.index]
     texto = [fmt(v, casas) for v in s.values]
     fig = go.Figure(go.Bar(
-        x=x, y=s.values,
+        x=x, y=s.values, name=nome,
         marker=dict(color=np.where(s.values >= 0, LARANJA, AZUL), cornerradius=4),
         text=texto if rotulos else None,
         textposition="outside", cliponaxis=False,

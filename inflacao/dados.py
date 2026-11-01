@@ -53,22 +53,31 @@ SGS_IPCA = {
 }
 
 
-def _get(url: str, tentativas: int = 4, timeout: int = 120):
+def _log(msg: str):
+    """Registro de tempos (aparece nos logs do Streamlit Cloud em 'Manage app')."""
+    print(f"[inflacao] {time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def _get(url: str, tentativas: int = 3, timeout: tuple[int, int] = (10, 60)):
+    """GET com limite de conexão/leitura (s) e poucas tentativas, para falhar rápido se a API travar."""
     erro = None
     for i in range(tentativas):
+        inicio = time.time()
         try:
             r = requests.get(url, headers=HEADERS, timeout=timeout)
             r.raise_for_status()
             return r.json()
         except Exception as e:  # noqa: BLE001
             erro = e
-            time.sleep(2 * (i + 1))
+            _log(f"tentativa {i + 1}/{tentativas} falhou em {time.time() - inicio:.1f}s: {url[:110]} ({e})")
+            if i < tentativas - 1:
+                time.sleep(2 * (i + 1))
     raise RuntimeError(f"Falha ao acessar {url}: {erro}")
 
 
 def ultimo_periodo(indice: str) -> str:
     """Último mês disponível no SIDRA (AAAAMM). Chamada leve, usada para detectar nova divulgação."""
-    meta = _get(SIDRA_META_URL.format(tabela=INDICES[indice].tabela_atual), timeout=30)
+    meta = _get(SIDRA_META_URL.format(tabela=INDICES[indice].tabela_atual), tentativas=2, timeout=(10, 20))
     return str(meta["periodicidade"]["fim"])
 
 
@@ -78,9 +87,9 @@ def _meses(inicio: str, fim: str) -> list[str]:
     return [p.strftime("%Y%m") for p in datas]
 
 
-def _sidra_bloco(tabela: int, variaveis: list[int], periodos: list[str]) -> pd.DataFrame:
+def _sidra_bloco(tabela: int, variaveis: list[int], periodos: list[str], categorias: str) -> pd.DataFrame:
     url = (f"{SIDRA_URL}/t/{tabela}/n1/all/v/{','.join(map(str, variaveis))}"
-           f"/p/{','.join(periodos)}/c315/all/h/n")
+           f"/p/{','.join(periodos)}/c315/{categorias}/h/n")
     dados = _get(url)
     df = pd.DataFrame(dados)[["V", "D2C", "D3C", "D4N"]]
     df.columns = ["valor", "variavel", "periodo", "componente"]
@@ -88,12 +97,13 @@ def _sidra_bloco(tabela: int, variaveis: list[int], periodos: list[str]) -> pd.D
     return df
 
 
-def sidra(tabela: int, variaveis: list[int], inicio: str, fim: str, bloco: int = 18) -> pd.DataFrame:
-    """Baixa todas as categorias (geral, grupos, subgrupos, itens e subitens) em blocos de meses."""
+def sidra(tabela: int, variaveis: list[int], inicio: str, fim: str, bloco: int = 18,
+          categorias: str = "all") -> pd.DataFrame:
+    """Baixa as categorias (por padrão: geral, grupos, subgrupos, itens e subitens) em blocos de meses."""
     meses = _meses(inicio, fim)
     blocos = [meses[i:i + bloco] for i in range(0, len(meses), bloco)]
     with ThreadPoolExecutor(max_workers=4) as ex:
-        partes = list(ex.map(lambda b: _sidra_bloco(tabela, variaveis, b), blocos))
+        partes = list(ex.map(lambda b: _sidra_bloco(tabela, variaveis, b, categorias), blocos))
     return pd.concat(partes, ignore_index=True)
 
 
@@ -118,14 +128,21 @@ def carregar_indice(indice: str, fim: str | None = None, inicio_historico: str =
     e MS (suavização de 12 meses), conforme a NT BCB nº 57.
     """
     cfg = INDICES[indice]
+    inicio = time.time()
     fim = fim or ultimo_periodo(indice)
     atual = sidra(cfg.tabela_atual, [cfg.var_mensal, cfg.var_peso], cfg.inicio_atual, fim)
     v, w, nomes = _pivotar(atual, cfg.var_mensal, cfg.var_peso)
+    _log(f"{indice}: estrutura atual baixada em {time.time() - inicio:.1f}s")
 
-    meta_ant = _get(SIDRA_META_URL.format(tabela=cfg.tabela_anterior), timeout=30)
+    # Da estrutura anterior bastam o índice geral, os itens e o subitem usado nas proxies (≈10x menos dados)
+    meta_ant = _get(SIDRA_META_URL.format(tabela=cfg.tabela_anterior), timeout=(10, 30))
     fim_ant = str(meta_ant["periodicidade"]["fim"])
-    ant = sidra(cfg.tabela_anterior, [cfg.var_mensal, cfg.var_peso], inicio_historico, fim_ant)
+    cats = [str(c["id"]) for c in meta_ant["classificacoes"][0]["categorias"]
+            if _codigo(c["nome"]) == "0" or len(_codigo(c["nome"])) == 4 or _codigo(c["nome"]) == "8104002"]
+    ant = sidra(cfg.tabela_anterior, [cfg.var_mensal, cfg.var_peso], inicio_historico, fim_ant,
+                categorias=",".join(cats))
     v_ant, w_ant, _ = _pivotar(ant, cfg.var_mensal, cfg.var_peso)
+    _log(f"{indice}: carga completa em {time.time() - inicio:.1f}s")
     v_ant, w_ant = _proxies_pof2020(v_ant, w_ant)
     v_ant = v_ant[v_ant.index < v.index.min()]
     w_ant = w_ant[w_ant.index < v.index.min()]
@@ -155,7 +172,9 @@ def _proxies_pof2020(v: pd.DataFrame, w: pd.DataFrame):
 
 
 def sgs(codigo: int, inicio: str = "01/01/2015") -> pd.Series:
-    dados = _get(f"{SGS_URL.format(codigo=codigo)}?formato=json&dataInicial={inicio}", timeout=60)
+    # Séries do SGS são opcionais (o cálculo próprio é idêntico): uma tentativa curta para não atrasar a página
+    dados = _get(f"{SGS_URL.format(codigo=codigo)}?formato=json&dataInicial={inicio}", tentativas=1,
+                 timeout=(5, 15))
     s = pd.DataFrame(dados)
     if s.empty:
         return pd.Series(dtype=float)
@@ -170,7 +189,7 @@ def sgs_oficiais_ipca(inicio: str = "01/01/2019") -> pd.DataFrame:
         except Exception:  # noqa: BLE001 — série indisponível não deve derrubar o relatório
             return pd.Series(dtype=float)
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=len(SGS_IPCA)) as ex:
         series = dict(zip(SGS_IPCA, ex.map(baixar, SGS_IPCA.values())))
     return pd.DataFrame(series).sort_index()
 
