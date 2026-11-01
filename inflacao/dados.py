@@ -75,10 +75,25 @@ def _get(url: str, tentativas: int = 3, timeout: tuple[int, int] = (10, 60)):
     raise RuntimeError(f"Falha ao acessar {url}: {erro}")
 
 
+def _ultimo_sidra(tabela: int, variavel: int, categorias: str = "7169") -> list[dict]:
+    """Último mês da tabela direto no SIDRA (por padrão só o índice geral, categoria 7169)."""
+    return _get(f"{SIDRA_URL}/t/{tabela}/n1/all/v/{variavel}/p/last/c315/{categorias}/h/n",
+                tentativas=2, timeout=(10, 30))
+
+
 def ultimo_periodo(indice: str) -> str:
-    """Último mês disponível no SIDRA (AAAAMM). Chamada leve, usada para detectar nova divulgação."""
-    meta = _get(SIDRA_META_URL.format(tabela=INDICES[indice].tabela_atual), tentativas=2, timeout=(10, 20))
-    return str(meta["periodicidade"]["fim"])
+    """Último mês disponível (AAAAMM). Chamada leve, usada para detectar nova divulgação.
+
+    Usa o SIDRA (apisidra.ibge.gov.br); a API de metadados (servicodados.ibge.gov.br) fica só como reserva,
+    pois nem sempre é acessível a partir de servidores fora do Brasil.
+    """
+    cfg = INDICES[indice]
+    try:
+        return str(_ultimo_sidra(cfg.tabela_atual, cfg.var_mensal)[0]["D3C"])
+    except Exception as e:  # noqa: BLE001
+        _log(f"SIDRA indisponível para o último período ({e}); tentando a API de metadados")
+        meta = _get(SIDRA_META_URL.format(tabela=cfg.tabela_atual), tentativas=2, timeout=(10, 20))
+        return str(meta["periodicidade"]["fim"])
 
 
 def _meses(inicio: str, fim: str) -> list[str]:
@@ -135,10 +150,10 @@ def carregar_indice(indice: str, fim: str | None = None, inicio_historico: str =
     _log(f"{indice}: estrutura atual baixada em {time.time() - inicio:.1f}s")
 
     # Da estrutura anterior bastam o índice geral, os itens e o subitem usado nas proxies (≈10x menos dados)
-    meta_ant = _get(SIDRA_META_URL.format(tabela=cfg.tabela_anterior), timeout=(10, 30))
-    fim_ant = str(meta_ant["periodicidade"]["fim"])
-    cats = [str(c["id"]) for c in meta_ant["classificacoes"][0]["categorias"]
-            if _codigo(c["nome"]) == "0" or len(_codigo(c["nome"])) == 4 or _codigo(c["nome"]) == "8104002"]
+    ultimo_ant = _ultimo_sidra(cfg.tabela_anterior, cfg.var_mensal, categorias="all")
+    fim_ant = str(ultimo_ant[0]["D3C"])
+    cats = [c["D4C"] for c in ultimo_ant
+            if _codigo(c["D4N"]) == "0" or len(_codigo(c["D4N"])) == 4 or _codigo(c["D4N"]) == "8104002"]
     ant = sidra(cfg.tabela_anterior, [cfg.var_mensal, cfg.var_peso], inicio_historico, fim_ant,
                 categorias=",".join(cats))
     v_ant, w_ant, _ = _pivotar(ant, cfg.var_mensal, cfg.var_peso)
@@ -177,7 +192,7 @@ def sgs(codigo: int, inicio: str = "01/01/2015") -> pd.Series:
                  timeout=(5, 15))
     s = pd.DataFrame(dados)
     if s.empty:
-        return pd.Series(dtype=float)
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
     s["data"] = pd.to_datetime(s["data"], format="%d/%m/%Y")
     return pd.to_numeric(s.set_index("data")["valor"], errors="coerce").rename(codigo)
 
@@ -187,7 +202,7 @@ def sgs_oficiais_ipca(inicio: str = "01/01/2019") -> pd.DataFrame:
         try:
             return sgs(codigo, inicio)
         except Exception:  # noqa: BLE001 — série indisponível não deve derrubar o relatório
-            return pd.Series(dtype=float)
+            return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
 
     with ThreadPoolExecutor(max_workers=len(SGS_IPCA)) as ex:
         series = dict(zip(SGS_IPCA, ex.map(baixar, SGS_IPCA.values())))
