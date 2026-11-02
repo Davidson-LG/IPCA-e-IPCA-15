@@ -182,12 +182,22 @@ def visoes(mensal: pd.DataFrame) -> dict[str, pd.DataFrame]:
     }
 
 
-def contribuicoes(dados: dict, data: pd.Timestamp) -> pd.DataFrame:
-    """Peso, variação e contribuição (peso × variação / 100, em p.p.) de cada componente no mês."""
+def contribuicoes(dados: dict, data: pd.Timestamp, inicio: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Peso (no mês final), variação e contribuição (p.p.) de cada componente entre inicio e data.
+
+    No mês: contribuição = peso × variação / 100. Num período, a variação é acumulada e a contribuição é encadeada,
+    Σ_t (w_t · v_t / 100) · Π_{s<t} (1 + I_s / 100), de modo que a soma dos grupos é a variação acumulada do índice.
+    A variação acumulada fica vazia se o componente não foi pesquisado em algum mês do período.
+    """
     V, W, nomes = dados["V"], dados["W"], dados["nomes"]
-    df = pd.DataFrame({"peso": W.loc[data], "variacao": V.loc[data]})
+    v, w = V.loc[inicio or data:data], W.loc[inicio or data:data]
+    encadeamento = (1 + v["0"] / 100).cumprod().shift(1, fill_value=1.0)
+    df = pd.DataFrame({
+        "peso": W.loc[data],
+        "variacao": ((1 + v / 100).prod(skipna=False) - 1) * 100,
+        "contribuicao": (w * v / 100).mul(encadeamento, axis=0).sum(min_count=1),
+    })
     df = df[df.index != "0"].dropna(how="all")
-    df["contribuicao"] = df["peso"] * df["variacao"] / 100
     df["nivel"] = df.index.map(lambda c: {1: "Grupo", 2: "Subgrupo", 4: "Item", 7: "Subitem"}.get(len(c)))
     df["componente"] = df.index.map(lambda c: nomes.get(c, c).split(".", 1)[-1])
     df["grupo"] = df.index.map(lambda c: nomes.get(c[0], c[0]).split(".", 1)[-1])
