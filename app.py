@@ -190,7 +190,8 @@ with st.sidebar:
 
 try:
     fim = periodo_disponivel(indice)
-    with st.spinner(f"Carregando {indice} no SIDRA/IBGE e calculando núcleos…"):
+    with st.spinner(f"Baixando o {indice} das APIs do IBGE e calculando núcleos… No primeiro acesso após uma "
+                    "divulgação isso pode levar até 1 minuto; depois os dados ficam em cache."):
         d, mensal, pesos, quando = calcular(indice, fim)
 except Exception as e:  # noqa: BLE001
     st.error(f"Não foi possível acessar as APIs do IBGE/BCB no momento. Tente novamente em instantes.\n\n{e}")
@@ -278,15 +279,29 @@ with aba[3]:
 # ---------------------------------------------------------------- Contribuições
 with aba[4]:
     datas = list(d["V"].index[::-1])
-    c1, c2 = st.columns([1, 2])
+    c1, c2, c3 = st.columns([1, 1.6, 1.6])
     with c1:
         mes_c = st.selectbox("Mês de referência", datas, format_func=lambda x: g.rotulo_mes(x, True))
     with c2:
-        busca = st.text_input("Filtrar por nome", placeholder="ex.: gasolina, aluguel, plano de saúde…")
-    tab_c = calculos.contribuicoes(d, mes_c)
-    total = mensal.at[mes_c, "ipca"]
-    st.caption(f"{indice} em {g.rotulo_mes(mes_c, True)}: {g.fmt(total)}%. "
-               "Contribuição = peso mensal × variação mensal ÷ 100, em pontos percentuais (p.p.).")
+        periodos = {"mes": "No mês", "ano": "No ano", "12m": "12 meses", "janela": f"Últimos {n_meses} meses"}
+        periodo = st.radio("Período", list(periodos), format_func=periodos.get, horizontal=True,
+                           help="A janela de 'Últimos N meses' é a da barra lateral.")
+    with c3:
+        busca = st.text_input("Filtrar por nome", placeholder="ex.: picanha, gasolina, aluguel…")
+    meses_periodo = {"mes": 1, "ano": mes_c.month, "12m": 12, "janela": n_meses}[periodo]
+    ini_c = max(mes_c - pd.DateOffset(months=meses_periodo - 1), d["V"].index[0])
+    tab_c = calculos.contribuicoes(d, mes_c, ini_c)
+    total = ((1 + mensal.loc[ini_c:mes_c, "ipca"] / 100).prod() - 1) * 100
+    if periodo == "mes":
+        st.caption(f"{indice} em {g.rotulo_mes(mes_c, True)}: {g.fmt(total)}%. "
+                   "Contribuição = peso mensal × variação mensal ÷ 100, em pontos percentuais (p.p.).")
+    else:
+        aviso = (f" A estrutura atual do {indice} começa em {g.rotulo_mes(ini_c, True)}; o período foi encurtado."
+                 if ini_c > mes_c - pd.DateOffset(months=meses_periodo - 1) else "")
+        st.caption(f"{indice} de {g.rotulo_mes(ini_c, True)} a {g.rotulo_mes(mes_c, True)}: {g.fmt(total)}% "
+                   f"acumulado. Variação = acumulada no período; peso = {g.rotulo_mes(mes_c)}; contribuição = soma "
+                   "das contribuições mensais encadeadas (somam a variação acumulada do índice, a menos de "
+                   f"centésimos de arredondamento do IBGE).{aviso}")
     sub = st.tabs(["Grupo", "Subgrupo", "Item", "Subitem"])
     for nivel, t in zip(["Grupo", "Subgrupo", "Item", "Subitem"], sub):
         with t:
@@ -307,16 +322,44 @@ with aba[4]:
                     "codigo": st.column_config.TextColumn("Código", width="small"),
                     "componente": st.column_config.TextColumn(nivel, width="medium"),
                     "grupo": st.column_config.TextColumn("Grupo", width="medium"),
-                    "peso": st.column_config.Column("Peso (%)", width="small"),
-                    "variacao": st.column_config.Column("Variação (%)", width="small"),
+                    "peso": st.column_config.Column(f"Peso {g.rotulo_mes(mes_c)} (%)", width="small"),
+                    "variacao": st.column_config.Column(
+                        {"mes": "Variação (%)", "ano": "Var. no ano (%)", "12m": "Var. 12m (%)",
+                         "janela": f"Var. {n_meses}m (%)"}[periodo], width="small"),
                     "contribuicao": st.column_config.Column("Contrib. (p.p.)", width="small"),
                 },
             )
             st.caption(f"{len(df)} componentes · soma das contribuições: "
                        f"{g.fmt(df['contribuicao'].sum(), 3)} p.p. · clique no cabeçalho para reordenar")
             n = 9 if nivel == "Grupo" else 10
+            rotulo_per = (g.rotulo_mes(mes_c) if periodo == "mes"
+                          else f"{g.rotulo_mes(ini_c)} a {g.rotulo_mes(mes_c)}")
+            barras_h = min(len(df[df["contribuicao"] > 0]), n) + min(len(df[df["contribuicao"] < 0]), n)
             st.plotly_chart(g.contribuicoes_horizontais(df, f"Maiores contribuições positivas e negativas — "
-                                                            f"{nivel.lower()}", n), width="stretch")
+                                                            f"{nivel.lower()} ({rotulo_per})", n,
+                                                        altura=min(520, 130 + 26 * barras_h)), width="stretch")
+
+    # Evolução mês a mês de um componente (ex.: picanha), na janela da barra lateral até o mês de referência
+    st.markdown("##### Evolução de um componente")
+    opcoes = tab_c.sort_values("codigo")
+    if busca:
+        achados = opcoes[opcoes["componente"].str.contains(busca, case=False, na=False)]
+        opcoes = achados if len(achados) else opcoes
+    rotulos_comp = {r.codigo: f"{r.componente} ({r.nivel.lower()} {r.codigo})" for r in opcoes.itertuples()}
+    cod = st.selectbox("Componente", list(rotulos_comp), format_func=rotulos_comp.get,
+                       help="Use o filtro por nome acima para encontrar o componente mais rápido.")
+    serie = d["V"][cod]
+    jan_c = serie.index[(serie.index > mes_c - pd.DateOffset(months=n_meses)) & (serie.index <= mes_c)]
+    nome_c = rotulos_comp[cod].rsplit(" (", 1)[0]
+    acum_jan = ((1 + serie.loc[jan_c] / 100).prod(skipna=False) - 1) * 100
+    st.caption(f"{nome_c}: {g.fmt(acum_jan)}% acumulado de {g.rotulo_mes(jan_c[0], True)} a "
+               f"{g.rotulo_mes(jan_c[-1], True)} ({len(jan_c)} meses) · peso em {g.rotulo_mes(mes_c)}: "
+               f"{g.fmt(d['W'].at[mes_c, cod], 4)}%")
+    st.plotly_chart(g.barras(serie.loc[jan_c], f"{nome_c} — variação mensal (%)", "Variação mensal", rotulos,
+                             altura=320), width="stretch")
+    doze_c = calculos.acumulado_12m(serie.to_frame())[cod]
+    st.plotly_chart(g.barras(doze_c.loc[jan_c], f"{nome_c} — acumulado em 12 meses (%)", "Acumulado em 12 meses",
+                             rotulos, altura=320), width="stretch")
 
 # ---------------------------------------------------------------- Metodologia
 with aba[5]:
@@ -342,7 +385,8 @@ derivadas do IPCA — metodologia consolidada*, com os vetores de agregação of
 - **Serviços intensivos em trabalho** (boxe RI dez/2013): mão de obra, médico, dentista, fisioterapeuta, psicólogo,
   costureira, manicure, cabeleireiro e barbeiro, empregado doméstico.
 - **Acumulados:** no ano e em 12 meses por capitalização composta das variações mensais.
-- **Contribuição:** peso mensal × variação mensal ÷ 100 (p.p.).
+- **Contribuição:** peso mensal × variação mensal ÷ 100 (p.p.). Em períodos (ano, 12 meses, janela), soma das
+  contribuições mensais encadeadas pelo índice acumulado até o mês anterior, que somam a variação acumulada do índice.
 
 **Validação** — para o IPCA, todas as séries calculadas reproduzem exatamente (2 casas decimais) as séries oficiais do
 BCB desde 2021. No IPCA, o relatório exibe o valor oficial do SGS quando já publicado e o cálculo próprio
